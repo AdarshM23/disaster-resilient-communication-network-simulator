@@ -285,11 +285,30 @@ class Simulator:
         packet.delivery_time = self.time
         self._event("delivered", packet=packet.id)
 
+    def _update_route(self, packet: Packet, route: list[str], reason: str, *,
+                      component: str | None = None,
+                      previous_route: list[str] | None = None) -> None:
+        """Store a route and emit an event only when the remaining route changes."""
+        old_route = list(packet.route if previous_route is None else previous_route)
+        packet.route = list(route)
+        if old_route == packet.route:
+            return
+        details = {
+            "packet": packet.id,
+            "previous_route": old_route,
+            "route": list(packet.route),
+            "reason": reason,
+        }
+        if component is not None:
+            details["component"] = component
+        self._event("route_recalculated", **details)
+
     def _network_changed(self, kind: str, component: str) -> None:
         self._event(kind, component=component)
         if kind == "node_added":
             self.queues[component] = []
-        if kind not in ("node_failed", "link_failed"):
+        health_changes = {"node_failed", "link_failed", "node_restored", "link_restored"}
+        if kind not in health_changes:
             return
         for packet in self.packets.values():
             if packet.status not in ("queued", "in_flight"):
@@ -299,16 +318,17 @@ class Simulator:
                     self.network.links[packet.link].source,
                     self.network.links[packet.link].destination)
                 affected = packet.node == component or incident
-            else:
+            elif kind == "link_failed":
                 affected = packet.link == component
+            else:
+                affected = False
             if affected:
                 self._drop(packet, kind)
             elif packet.status == "queued":
-                packet.route = self.network.route(packet.node, packet.destination)
+                route = self.network.route(packet.node, packet.destination)
+                self._update_route(packet, route, kind, component=component)
                 if not packet.route:
                     self._drop(packet, "unreachable")
-                else:
-                    self._event("route_recalculated", packet=packet.id, route=list(packet.route))
 
     def set_node_active(self, node: str, active: bool) -> None:
         if type(active) is not bool:
@@ -359,7 +379,8 @@ class Simulator:
             waiting = [self.packets[i] for queue in self.queues.values() for i in queue]
             waiting.sort(key=lambda p: (p.priority != "emergency", p.queue_order))
             for packet in waiting:
-                packet.route = self.network.route(packet.node, packet.destination, penalties)
+                route = self.network.route(packet.node, packet.destination, penalties)
+                self._update_route(packet, route, "forwarding")
                 if not packet.route:
                     self._drop(packet, "unreachable")
                     continue
@@ -387,7 +408,12 @@ class Simulator:
                     if node == packet.destination:
                         self._deliver(packet)
                     else:
-                        packet.route = self.network.route(node, packet.destination)
+                        expected_route = packet.route
+                        if node in packet.route:
+                            expected_route = packet.route[packet.route.index(node):]
+                        route = self.network.route(node, packet.destination)
+                        self._update_route(packet, route, "arrival",
+                                           previous_route=expected_route)
                         if not packet.route:
                             self._drop(packet, "unreachable")
                         else:
