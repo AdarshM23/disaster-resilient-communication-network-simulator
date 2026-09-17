@@ -7,7 +7,7 @@ python3 -m unittest discover -s tests -v
 python3 -m simulator
 ```
 
-The demonstration prints packet events, routes, failures/recovery, and measured metrics as JSON. Emergency traffic receives priority. Queued packets reroute around failed components; unreachable packets are dropped with an explicit reason. Congestion-aware Dijkstra routing uses queued byte demand as a cost penalty.
+The demonstration prints packet events, routes, failures/recovery, and measured metrics as JSON. Packets wait in finite per-link queues, where emergency traffic is genuinely transmitted before waiting normal traffic. Queued packets reroute around failed components; unreachable packets are dropped with an explicit reason. Congestion-aware Dijkstra routing uses actual queued byte demand as a cost penalty.
 
 ```python
 from simulator import Link, Network, Node, Simulator
@@ -33,7 +33,7 @@ assert lost.drop_reason == "unreachable"
 sim.network.recover_link("radio")
 ```
 
-Bandwidth is bytes per simulated second; packet size is bytes. Link `current_load` is bytes transmitted in the last tick, and utilization is a fraction from 0 to 1. Metrics report latency in seconds, throughput in bits/second, and packet loss as a percentage.
+Bandwidth is bytes per simulated second; packet size is bytes. Link `current_load` is bytes transmitted in the last tick, and utilization is a fraction from 0 to 1. Metrics report overall and per-class latency in seconds, throughput in bits/second, packet counts/loss, link utilization, and queue depth. Emergency services are `hospital`, `ambulance`, `police`, `fire`, and `rescue`; the generic `emergency` class is also accepted.
 
 Use network methods to change topology or component health. Each simulator owns an independent graph copy; modifying the original network does not alter an existing simulation. `snapshot()` returns detached JSON-serializable state.
 

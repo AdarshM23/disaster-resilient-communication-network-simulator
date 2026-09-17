@@ -193,6 +193,7 @@ class Packet:
     remaining_bytes: int = 0
     drop_reason: str | None = None
     queue_order: int = 0
+    queued_link: str | None = None
 
     @property
     def created_at(self) -> int:
@@ -201,6 +202,16 @@ class Packet:
     @property
     def delivered_at(self) -> int | None:
         return self.delivery_time
+
+    @property
+    def packet_class(self) -> str:
+        return self.priority
+
+    @property
+    def latency_seconds(self) -> int | None:
+        if self.delivery_time is None:
+            return None
+        return self.delivery_time - self.creation_time
 
 
 class Simulator:
@@ -222,6 +233,7 @@ class Simulator:
         self.time = 0
         self.packets: dict[int, Packet] = {}
         self.queues: dict[str, list[int]] = {node: [] for node in network.nodes}
+        self.link_queues: dict[str, list[int]] = {link: [] for link in network.links}
         self.events: list[dict] = []
         self._queue_sequence = 0
         self.network._on_change = self._network_changed
@@ -233,14 +245,21 @@ class Simulator:
                size: int | None = None, priority: str | None = None) -> Packet:
         if source not in self.network.nodes or destination not in self.network.nodes:
             raise ValueError("unknown packet endpoint")
-        if traffic not in self.EMERGENCY | {"normal"}:
+        if not isinstance(traffic, str):
+            raise ValueError("unknown traffic class")
+        traffic = traffic.lower()
+        if traffic not in self.EMERGENCY | {"normal", "emergency"}:
             raise ValueError("unknown traffic class")
         size = self.packet_bytes if size is None else size
         positive_integer(size, "packet size")
-        priority = ("emergency" if traffic in self.EMERGENCY else "normal") if priority is None else priority
+        emergency = traffic == "emergency" or traffic in self.EMERGENCY
+        if priority is not None and not isinstance(priority, str):
+            raise ValueError("priority must be normal or emergency")
+        priority = priority.lower() if priority is not None else None
+        priority = ("emergency" if emergency else "normal") if priority is None else priority
         if priority not in ("normal", "emergency"):
             raise ValueError("priority must be normal or emergency")
-        if traffic in self.EMERGENCY and priority != "emergency":
+        if emergency and priority != "emergency":
             raise ValueError("emergency traffic must have emergency priority")
         packet = Packet(len(self.packets) + 1, source, destination, size, priority,
                         self.time, self.time + self.lifetime, source, traffic=traffic,
@@ -263,17 +282,40 @@ class Simulator:
 
     def _enqueue(self, packet: Packet, node: str) -> None:
         packet.node = node
-        if len(self.queues[node]) >= self.queue_capacity:
-            self._drop(packet, "queue_overflow")
-        else:
-            packet.status = "queued"
-            self._queue_sequence += 1
-            packet.queue_order = self._queue_sequence
-            self.queues[node].append(packet.id)
+        packet.status = "queued"
+        self._queue_sequence += 1
+        packet.queue_order = self._queue_sequence
+        self.queues[node].append(packet.id)
+        self._assign_link_queue(packet)
 
-    def _drop(self, packet: Packet, reason: str) -> None:
+    def _remove_from_queues(self, packet: Packet) -> None:
         if packet.node is not None and packet.id in self.queues[packet.node]:
             self.queues[packet.node].remove(packet.id)
+        if (packet.queued_link is not None
+                and packet.id in self.link_queues[packet.queued_link]):
+            self.link_queues[packet.queued_link].remove(packet.id)
+        packet.queued_link = None
+
+    def _assign_link_queue(self, packet: Packet) -> None:
+        """Place a queued packet on the output link selected by its route."""
+        if packet.status != "queued" or packet.node is None or len(packet.route) < 2:
+            return
+        link_id = self.network.adjacency[packet.node][packet.route[1]]
+        if packet.queued_link == link_id:
+            return
+        if packet.queued_link is not None:
+            self.link_queues[packet.queued_link].remove(packet.id)
+            packet.queued_link = None
+        if len(self.link_queues[link_id]) >= self.queue_capacity:
+            self._drop(packet, "queue_overflow")
+            return
+        packet.queued_link = link_id
+        self.link_queues[link_id].append(packet.id)
+        self._event("queued", packet=packet.id, node=packet.node, link=link_id,
+                    priority=packet.priority, route=list(packet.route))
+
+    def _drop(self, packet: Packet, reason: str) -> None:
+        self._remove_from_queues(packet)
         packet.status = "dropped"
         packet.drop_reason = reason
         packet.link = packet.next_node = packet.arrives_at = None
@@ -307,6 +349,8 @@ class Simulator:
         self._event(kind, component=component)
         if kind == "node_added":
             self.queues[component] = []
+        elif kind == "link_added":
+            self.link_queues[component] = []
         health_changes = {"node_failed", "link_failed", "node_restored", "link_restored"}
         if kind not in health_changes:
             return
@@ -329,6 +373,8 @@ class Simulator:
                 self._update_route(packet, route, kind, component=component)
                 if not packet.route:
                     self._drop(packet, "unreachable")
+                else:
+                    self._assign_link_queue(packet)
 
     def set_node_active(self, node: str, active: bool) -> None:
         if type(active) is not bool:
@@ -342,12 +388,8 @@ class Simulator:
 
     def _penalties(self) -> dict[str, float]:
         demand = dict.fromkeys(self.network.links, 0)
-        for node, queue in self.queues.items():
-            for packet_id in queue:
-                packet = self.packets[packet_id]
-                path = self.network.route(node, packet.destination)
-                if len(path) > 1:
-                    demand[self.network.adjacency[node][path[1]]] += packet.size
+        for link_id, queue in self.link_queues.items():
+            demand[link_id] += sum(self.packets[packet_id].size for packet_id in queue)
         for packet in self.packets.values():
             if packet.status == "in_flight":
                 demand[packet.link] += packet.remaining_bytes
@@ -377,24 +419,33 @@ class Simulator:
                     self._transmit_bytes(packet, self.network.links[packet.link])
             penalties = self._penalties()
             waiting = [self.packets[i] for queue in self.queues.values() for i in queue]
-            waiting.sort(key=lambda p: (p.priority != "emergency", p.queue_order))
+            waiting.sort(key=lambda p: p.queue_order)
             for packet in waiting:
                 route = self.network.route(packet.node, packet.destination, penalties)
                 self._update_route(packet, route, "forwarding")
                 if not packet.route:
                     self._drop(packet, "unreachable")
                     continue
-                link = self.network.links[self.network.adjacency[packet.route[0]][packet.route[1]]]
-                if link.current_load >= link.bandwidth:
-                    continue
-                self.queues[packet.node].remove(packet.id)
-                packet.status = "in_flight"
-                packet.node = None
-                packet.link = link.id
-                packet.next_node = packet.route[1]
-                packet.remaining_bytes = packet.size
-                self._event("transmitted", packet=packet.id, link=link.id, route=list(packet.route))
-                self._transmit_bytes(packet, link)
+                self._assign_link_queue(packet)
+            for link_id, queue in self.link_queues.items():
+                link = self.network.links[link_id]
+                ordered = sorted(queue, key=lambda packet_id: (
+                    self.packets[packet_id].priority != "emergency",
+                    self.packets[packet_id].queue_order,
+                ))
+                for packet_id in ordered:
+                    if link.current_load >= link.bandwidth:
+                        break
+                    packet = self.packets[packet_id]
+                    self._remove_from_queues(packet)
+                    packet.status = "in_flight"
+                    packet.node = None
+                    packet.link = link.id
+                    packet.next_node = packet.route[1]
+                    packet.remaining_bytes = packet.size
+                    self._event("transmitted", packet=packet.id, link=link.id,
+                                priority=packet.priority, route=list(packet.route))
+                    self._transmit_bytes(packet, link)
             self.time += 1
             for packet in self.packets.values():
                 if packet.status in {"queued", "in_flight"} and packet.deadline <= self.time:
@@ -421,24 +472,63 @@ class Simulator:
 
     def metrics(self) -> dict:
         delivered = [p for p in self.packets.values() if p.status == "delivered"]
-        dropped = sum(p.status == "dropped" for p in self.packets.values())
+        dropped_packets = [p for p in self.packets.values() if p.status == "dropped"]
+        dropped = len(dropped_packets)
         count = len(self.packets)
-        average_latency = (sum(p.delivery_time - p.creation_time for p in delivered)
-                           / len(delivered) if delivered else None)
+
+        def average_latency(packets: list[Packet]) -> float | None:
+            return (sum(p.delivery_time - p.creation_time for p in packets) / len(packets)
+                    if packets else None)
+
+        average = average_latency(delivered)
+        emergency_delivered = [p for p in delivered if p.priority == "emergency"]
+        normal_delivered = [p for p in delivered if p.priority == "normal"]
+        emergency_latency = average_latency(emergency_delivered)
+        normal_latency = average_latency(normal_delivered)
+
+        def class_metrics(packet_class: str) -> dict:
+            packets = [p for p in self.packets.values() if p.priority == packet_class]
+            class_delivered = [p for p in packets if p.status == "delivered"]
+            return {
+                "generated": len(packets),
+                "delivered": len(class_delivered),
+                "dropped": sum(p.status == "dropped" for p in packets),
+                "pending": sum(p.status in {"queued", "in_flight"} for p in packets),
+                "average_latency_seconds": average_latency(class_delivered),
+            }
+
         return {
             "elapsed_seconds": self.time,
             "injected": count, "delivered": len(delivered), "dropped": dropped,
+            "packets_generated": count,
+            "packets_delivered": len(delivered),
+            "packets_dropped": dropped,
             "pending": count - len(delivered) - dropped,
-            "average_latency_seconds": average_latency,
-            "mean_latency_seconds": average_latency,
+            "average_latency_seconds": average,
+            "mean_latency_seconds": average,
+            "packet_latency_seconds": average,
+            "emergency_packet_latency_seconds": emergency_latency,
+            "normal_packet_latency_seconds": normal_latency,
+            "emergency_average_latency_seconds": emergency_latency,
+            "normal_average_latency_seconds": normal_latency,
             "throughput_bps": sum(p.size for p in delivered) * 8 / self.time if self.time else 0,
             "packet_loss_ratio": dropped / count if count else 0,
             "packet_loss_percentage": 100 * dropped / count if count else 0,
+            "traffic_classes": {
+                "normal": class_metrics("normal"),
+                "emergency": class_metrics("emergency"),
+            },
             "links": {key: {
                 "transmitted_bytes": link.transmitted_bytes,
                 "available_bytes": link.available_bytes,
                 "current_load": link.current_load,
                 "utilization": link.utilization,
+                "queue_depth": len(self.link_queues[key]),
+                "queue_capacity": self.queue_capacity,
+                "queued_normal": sum(self.packets[packet_id].priority == "normal"
+                                     for packet_id in self.link_queues[key]),
+                "queued_emergency": sum(self.packets[packet_id].priority == "emergency"
+                                        for packet_id in self.link_queues[key]),
                 "last_tick_utilization": (link.current_load / link.last_available_bytes
                                           if link.last_available_bytes else None),
             } for key, link in self.network.links.items()},
@@ -451,6 +541,9 @@ class Simulator:
             "links": [dict(asdict(link), utilization=link.utilization)
                       for link in self.network.links.values()],
             "queues": {node: list(queue) for node, queue in self.queues.items()},
-            "packets": [asdict(packet) for packet in self.packets.values()],
+            "link_queues": {link: list(queue) for link, queue in self.link_queues.items()},
+            "packets": [dict(asdict(packet), packet_class=packet.packet_class,
+                             latency_seconds=packet.latency_seconds)
+                        for packet in self.packets.values()],
             "metrics": self.metrics(), "events": deepcopy(self.events),
         }
