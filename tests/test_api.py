@@ -64,8 +64,24 @@ class ApiTests(unittest.TestCase):
             "/traffic/normal", "/traffic/emergency", "/nodes/{id}/fail",
             "/nodes/{id}/recover", "/links/{id}/fail",
             "/links/{id}/recover", "/metrics", "/events",
+            "/nodes", "/links", "/disasters/trigger",
         }
         self.assertTrue(expected.issubset(paths))
+
+        cors = self.client.options("/topology", headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        })
+        self.assertEqual(cors.status_code, 200)
+        self.assertEqual(cors.headers["access-control-allow-origin"],
+                         "http://localhost:5173")
+        preview_cors = self.client.options("/topology", headers={
+            "Origin": "http://127.0.0.1:4173",
+            "Access-Control-Request-Method": "GET",
+        })
+        self.assertEqual(preview_cors.status_code, 200)
+        self.assertEqual(preview_cors.headers["access-control-allow-origin"],
+                         "http://127.0.0.1:4173")
 
     def test_start_clock_pause_and_reset(self):
         started = self.start_test_simulation(tick_interval=0.01)
@@ -156,6 +172,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(failed.status_code, 200, failed.text)
         self.assertIn({"component_type": "node", "component": "B"},
                       failed.json()["failures"])
+        self.assertEqual(len(failed.json()["nodes"]), len(TEST_TOPOLOGY["nodes"]))
+        self.assertEqual(len(failed.json()["links"]), len(TEST_TOPOLOGY["links"]))
+        failed_node = next(node for node in failed.json()["nodes"] if node["id"] == "B")
+        self.assertEqual(failed_node["status"], "failed")
         self.assertEqual(failed.json()["active_routes"][0]["route"], ["A", "C", "D"])
 
         recovered = self.client.post("/nodes/B/recover")
@@ -189,6 +209,78 @@ class ApiTests(unittest.TestCase):
             "source": "A", "destination": "D", "fake_latency": 1,
         })
         self.assertEqual(extra_field.status_code, 422)
+
+    def test_topology_editor_crud_and_reset_preserve_edited_graph(self):
+        created = self.client.post("/nodes", json={
+            "id": "police-1", "name": "Police Station 1", "type": "police",
+            "x": 125, "y": 240,
+        })
+        self.assertEqual(created.status_code, 201, created.text)
+        police = next(node for node in created.json()["nodes"]
+                      if node["id"] == "police-1")
+        self.assertEqual((police["type"], police["x"], police["y"]),
+                         ("police", 125, 240))
+
+        link = self.client.post("/links", json={
+            "id": "police-router", "source": "police-1", "destination": "router",
+            "bandwidth": 4096, "latency": 2,
+        })
+        self.assertEqual(link.status_code, 201, link.text)
+        updated = self.client.patch("/links/police-router", json={
+            "bandwidth": 8192, "latency": 3,
+        })
+        self.assertEqual(updated.status_code, 200, updated.text)
+        edited_link = next(item for item in updated.json()["links"]
+                           if item["id"] == "police-router")
+        self.assertEqual((edited_link["bandwidth"], edited_link["latency"]),
+                         (8192, 3))
+
+        moved = self.client.patch("/nodes/police-1", json={"x": 300, "y": 90})
+        moved_node = next(node for node in moved.json()["nodes"]
+                          if node["id"] == "police-1")
+        self.assertEqual((moved_node["x"], moved_node["y"]), (300, 90))
+
+        self.client.post("/nodes/police-1/fail")
+        self.client.post("/simulation/reset")
+        reset_state = self.client.get("/topology").json()
+        reset_node = next(node for node in reset_state["nodes"]
+                          if node["id"] == "police-1")
+        self.assertEqual(reset_node["status"], "operational")
+        self.assertTrue(any(item["id"] == "police-router"
+                            for item in reset_state["links"]))
+
+        deleted_link = self.client.delete("/links/police-router")
+        self.assertEqual(deleted_link.status_code, 200, deleted_link.text)
+        self.assertFalse(any(item["id"] == "police-router"
+                             for item in deleted_link.json()["links"]))
+        deleted_node = self.client.delete("/nodes/police-1")
+        self.assertEqual(deleted_node.status_code, 200, deleted_node.text)
+        self.assertFalse(any(node["id"] == "police-1"
+                             for node in deleted_node.json()["nodes"]))
+
+    def test_disaster_endpoint_mutates_engine_and_records_events(self):
+        self.start_test_simulation()
+        response = self.client.post("/disasters/trigger", json={
+            "disaster": "earthquake", "intensity": "medium", "seed": 11,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["failed_nodes"])
+        self.assertTrue(body["failed_links"])
+        failed = {(item["component_type"], item["component"])
+                  for item in body["topology"]["failures"]}
+        self.assertTrue(all(("node", node_id) in failed
+                            for node_id in body["failed_nodes"]))
+        self.assertTrue(all(("link", link_id) in failed
+                            for link_id in body["failed_links"]))
+        kinds = [event["kind"] for event in self.client.get("/events").json()["events"]]
+        self.assertEqual(kinds[0], "disaster_triggered")
+        self.assertEqual(kinds[-1], "recalculating_routes")
+
+        invalid = self.client.post("/disasters/trigger", json={
+            "disaster": "meteor", "intensity": "extreme",
+        })
+        self.assertEqual(invalid.status_code, 422)
 
 
 if __name__ == "__main__":

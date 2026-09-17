@@ -56,6 +56,35 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(second.network.route("A", "B"), ["A", "B"])
         self.assertEqual(network.nodes["A"].status, "operational")
 
+    def test_editor_metadata_updates_and_topology_deletion(self):
+        sim = diamond()
+        sim.network.update_node("A", name="Hospital", type="hospital", x=25, y=40)
+        self.assertEqual((sim.network.nodes["A"].name, sim.network.nodes["A"].type,
+                          sim.network.nodes["A"].x, sim.network.nodes["A"].y),
+                         ("Hospital", "hospital", 25, 40))
+        sim.network.update_link("ab", bandwidth=2048, latency=3)
+        self.assertEqual((sim.network.links["ab"].bandwidth,
+                          sim.network.links["ab"].latency), (2048, 3))
+
+        packet = sim.inject("A", "D")
+        self.assertEqual(packet.route, ["A", "C", "D"])
+        sim.network.remove_link("ac")
+        self.assertEqual(packet.route, ["A", "B", "D"])
+        self.assertNotIn("ac", sim.link_queues)
+        sim.network.remove_node("B")
+        self.assertEqual(packet.status, "dropped")
+        self.assertNotIn("B", sim.network.nodes)
+        self.assertNotIn("ab", sim.network.links)
+        self.assertNotIn("bd", sim.network.links)
+
+    def test_deleting_destination_drops_active_packet(self):
+        sim = pair()
+        packet = sim.inject("A", "B")
+        sim.network.remove_node("B")
+        self.assertEqual((packet.status, packet.drop_reason),
+                         ("dropped", "endpoint_deleted"))
+        self.assertEqual(sim.queues["A"], [])
+
 
 class RoutingTests(unittest.TestCase):
     def test_dijkstra_weighted_shortest_path(self):
@@ -228,6 +257,37 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(sim.inject("A", "A").status, "delivered")
         self.assertEqual(sim.metrics()["average_latency_seconds"], 0)
         self.assertEqual(sim.network.links["ab"].transmitted_bytes, 0)
+
+    def test_disaster_presets_fail_real_components_deterministically(self):
+        nodes = [
+            Node("R1", "Router 1", type="router", x=0, y=0),
+            Node("R2", "Router 2", type="router", x=10, y=0),
+            Node("H", "Hospital", type="hospital", x=100, y=100),
+            Node("P", "Police", type="police", x=110, y=100),
+        ]
+        links = [
+            Link("r1-r2", "R1", "R2"), Link("r1-h", "R1", "H"),
+            Link("r2-p", "R2", "P"), Link("h-p", "H", "P"),
+        ]
+
+        def run(kind):
+            sim = Simulator(Network(nodes, links))
+            result = sim.trigger_disaster(kind, "medium", seed=7)
+            for node_id in result["failed_nodes"]:
+                self.assertEqual(sim.network.nodes[node_id].status, "failed")
+            for link_id in result["failed_links"]:
+                self.assertEqual(sim.network.links[link_id].status, "failed")
+            self.assertEqual(sim.events[0]["kind"], "disaster_triggered")
+            self.assertEqual(sim.events[-1]["kind"], "recalculating_routes")
+            return result
+
+        for disaster in ("earthquake", "flood", "cyclone", "cyberattack"):
+            with self.subTest(disaster=disaster):
+                self.assertEqual(run(disaster), run(disaster))
+        cyber = run("cyberattack")
+        self.assertTrue(cyber["failed_nodes"])
+        self.assertTrue(all(node_id in {"R1", "R2"}
+                            for node_id in cyber["failed_nodes"]))
 
 
 class MetricsTests(unittest.TestCase):

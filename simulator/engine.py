@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import heapq
 import math
+import random
 from typing import Callable
 
 
@@ -25,16 +26,39 @@ def valid_status(status: str) -> None:
         raise ValueError("status must be operational or failed")
 
 
+NODE_TYPES = frozenset({
+    "router", "switch", "hospital", "police", "fire", "rescue", "ambulance",
+})
+
+
+def valid_node_type(node_type: str) -> None:
+    if node_type not in NODE_TYPES:
+        raise ValueError("unknown node type")
+
+
+def valid_coordinate(value: float | None, name: str) -> None:
+    if value is not None and (isinstance(value, bool)
+                              or not isinstance(value, (int, float))
+                              or not math.isfinite(value)):
+        raise ValueError(f"{name} must be a finite number or null")
+
+
 @dataclass
 class Node:
     id: str
     name: str
     status: str = "operational"
+    type: str = "router"
+    x: float | None = None
+    y: float | None = None
 
     def __post_init__(self):
         valid_id(self.id)
         valid_id(self.name)
         valid_status(self.status)
+        valid_node_type(self.type)
+        valid_coordinate(self.x, "x")
+        valid_coordinate(self.y, "y")
 
 
 @dataclass
@@ -102,6 +126,51 @@ class Network:
         self.adjacency[link.destination][link.source] = link.id
         self._notify("link_added", link.id)
         return link
+
+    def update_node(self, node_id: str, *, name: str, type: str,
+                    x: float | None, y: float | None) -> Node:
+        """Update editor metadata without bypassing graph change notifications."""
+        if node_id not in self.nodes:
+            raise ValueError("unknown node ID")
+        candidate = Node(node_id, name, self.nodes[node_id].status, type, x, y)
+        node = self.nodes[node_id]
+        node.name, node.type, node.x, node.y = (
+            candidate.name, candidate.type, candidate.x, candidate.y,
+        )
+        self._notify("node_updated", node_id)
+        return node
+
+    def update_link(self, link_id: str, *, bandwidth: int, latency: int) -> Link:
+        """Update link capacity/cost after validating the complete replacement."""
+        if link_id not in self.links:
+            raise ValueError("unknown link ID")
+        link = self.links[link_id]
+        candidate = Link(link.id, link.source, link.destination, bandwidth, latency,
+                         link.status)
+        link.bandwidth, link.latency = candidate.bandwidth, candidate.latency
+        self._notify("link_updated", link_id)
+        return link
+
+    def remove_link(self, link_id: str) -> None:
+        if link_id not in self.links:
+            raise ValueError("unknown link ID")
+        link = self.links[link_id]
+        self._notify("link_removing", link_id)
+        del self.adjacency[link.source][link.destination]
+        del self.adjacency[link.destination][link.source]
+        del self.links[link_id]
+        self._notify("link_deleted", link_id)
+
+    def remove_node(self, node_id: str) -> None:
+        if node_id not in self.nodes:
+            raise ValueError("unknown node ID")
+        incident_links = sorted(self.adjacency[node_id].values())
+        self._notify("node_removing", node_id)
+        for link_id in incident_links:
+            self.remove_link(link_id)
+        del self.adjacency[node_id]
+        del self.nodes[node_id]
+        self._notify("node_deleted", node_id)
 
     @classmethod
     def from_dict(cls, configuration: dict) -> "Network":
@@ -346,13 +415,47 @@ class Simulator:
         self._event("route_recalculated", **details)
 
     def _network_changed(self, kind: str, component: str) -> None:
-        self._event(kind, component=component)
+        if kind not in {"link_removing", "node_removing"}:
+            self._event(kind, component=component)
         if kind == "node_added":
             self.queues[component] = []
         elif kind == "link_added":
             self.link_queues[component] = []
-        health_changes = {"node_failed", "link_failed", "node_restored", "link_restored"}
-        if kind not in health_changes:
+        elif kind == "link_removing":
+            for packet in list(self.packets.values()):
+                if packet.status == "in_flight" and packet.link == component:
+                    self._drop(packet, "link_deleted")
+            return
+        elif kind == "node_removing":
+            for packet in list(self.packets.values()):
+                if packet.status not in {"queued", "in_flight"}:
+                    continue
+                incident = packet.link is not None and component in (
+                    self.network.links[packet.link].source,
+                    self.network.links[packet.link].destination,
+                )
+                if component in {packet.source, packet.destination}:
+                    self._drop(packet, "endpoint_deleted")
+                elif packet.node == component or incident:
+                    self._drop(packet, "node_deleted")
+            return
+        elif kind == "link_deleted":
+            for packet_id in self.link_queues.pop(component, []):
+                packet = self.packets[packet_id]
+                if packet.status == "queued":
+                    packet.queued_link = None
+        elif kind == "node_deleted":
+            self.queues.pop(component, None)
+            for packet in list(self.packets.values()):
+                if (packet.status in {"queued", "in_flight"}
+                        and component in {packet.source, packet.destination}):
+                    self._drop(packet, "endpoint_deleted")
+
+        route_changes = {
+            "node_failed", "link_failed", "node_restored", "link_restored",
+            "link_updated", "link_deleted", "node_deleted",
+        }
+        if kind not in route_changes:
             return
         for packet in self.packets.values():
             if packet.status not in ("queued", "in_flight"):
@@ -375,6 +478,91 @@ class Simulator:
                     self._drop(packet, "unreachable")
                 else:
                     self._assign_link_queue(packet)
+
+    def trigger_disaster(self, disaster: str, intensity: str = "medium", *,
+                         seed: int = 0) -> dict[str, list[str] | str]:
+        """Fail real components using deterministic, educational disaster presets."""
+        if not isinstance(disaster, str) or disaster.lower() not in {
+            "earthquake", "flood", "cyclone", "cyberattack",
+        }:
+            raise ValueError("unknown disaster type")
+        if not isinstance(intensity, str) or intensity.lower() not in {
+            "low", "medium", "high",
+        }:
+            raise ValueError("unknown disaster intensity")
+        if type(seed) is not int:
+            raise ValueError("disaster seed must be an integer")
+        disaster = disaster.lower()
+        intensity = intensity.lower()
+        fraction = {"low": 0.2, "medium": 0.4, "high": 0.65}[intensity]
+        rng = random.Random(seed)
+        nodes = sorted(node.id for node in self.network.nodes.values()
+                       if node.status == "operational")
+        links = sorted(link.id for link in self.network.links.values()
+                       if link.status == "operational")
+
+        def choose(values: list[str], count: int) -> list[str]:
+            count = min(len(values), max(0, count))
+            return sorted(rng.sample(values, count)) if count else []
+
+        failed_nodes: list[str] = []
+        failed_links: list[str] = []
+        if disaster == "earthquake":
+            failed_nodes = choose(nodes, math.ceil(len(nodes) * fraction / 2))
+            failed_links = choose(links, math.ceil(len(links) * fraction / 2))
+        elif disaster == "cyclone":
+            failed_links = choose(links, math.ceil(len(links) * fraction))
+            failed_nodes = choose(nodes, round(len(nodes) * fraction * 0.2))
+        elif disaster == "cyberattack":
+            infrastructure = [node_id for node_id in nodes
+                              if self.network.nodes[node_id].type in {"router", "switch"}]
+            failed_nodes = choose(infrastructure,
+                                  math.ceil(len(infrastructure) * fraction))
+            failed_links = choose(links, round(len(links) * fraction * 0.15))
+        else:
+            components: list[tuple[float, float, str, str]] = []
+            for node_id in nodes:
+                node = self.network.nodes[node_id]
+                if node.x is not None and node.y is not None:
+                    components.append((float(node.x), float(node.y), "node", node_id))
+            for link_id in links:
+                link = self.network.links[link_id]
+                source, destination = (self.network.nodes[link.source],
+                                       self.network.nodes[link.destination])
+                if None not in (source.x, source.y, destination.x, destination.y):
+                    components.append(((source.x + destination.x) / 2,
+                                       (source.y + destination.y) / 2,
+                                       "link", link_id))
+            count = math.ceil((len(nodes) + len(links)) * fraction * 0.6)
+            if components:
+                anchor = rng.choice(components)
+                nearby = sorted(components, key=lambda item: (
+                    (item[0] - anchor[0]) ** 2 + (item[1] - anchor[1]) ** 2,
+                    item[2], item[3],
+                ))[:count]
+                failed_nodes = sorted(item[3] for item in nearby if item[2] == "node")
+                failed_links = sorted(item[3] for item in nearby if item[2] == "link")
+            else:
+                combined = [("node", item) for item in nodes] + [
+                    ("link", item) for item in links
+                ]
+                selected = rng.sample(combined, min(len(combined), count)) if count else []
+                failed_nodes = sorted(item for kind, item in selected if kind == "node")
+                failed_links = sorted(item for kind, item in selected if kind == "link")
+
+        self._event("disaster_triggered", disaster=disaster,
+                    intensity=intensity, seed=seed)
+        for node_id in failed_nodes:
+            self.network.fail_node(node_id)
+        for link_id in failed_links:
+            self.network.fail_link(link_id)
+        self._event("recalculating_routes", disaster=disaster)
+        return {
+            "disaster": disaster,
+            "intensity": intensity,
+            "failed_nodes": failed_nodes,
+            "failed_links": failed_links,
+        }
 
     def set_node_active(self, node: str, active: bool) -> None:
         if type(active) is not bool:

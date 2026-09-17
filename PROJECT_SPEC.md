@@ -8,24 +8,33 @@ Implementation order:
 1. Core models, configurable graph, Dijkstra, packet generation, transmission, and delivery — implemented.
 2. Failure/recovery, congestion-aware routing, emergency scheduling, measured metrics, and core tests — implemented.
 3. FastAPI topology, lifecycle, traffic injection, failure/recovery, metrics, and event endpoints — implemented. One engine instance is owned by the API manager and mutations are serialized.
-4. Later: React graph visualization using snapshots/events, controls, and metric charts.
+4. React graph visualization using snapshots/events, controls, and metric charts — implemented.
 
-Steps 1 through 3 are implemented. No frontend is implemented.
+All four demonstration layers are implemented.
 
 ## FastAPI backend
 
-- `backend.app` exposes the engine through `GET /topology`, `GET /metrics`, `GET /events`, simulation start/pause/reset controls, normal/emergency traffic injection, and node/link failure and recovery controls.
-- The API manager owns one `Simulator`, protects it with an asynchronous lock, and advances it by one engine tick at each configured real-time interval while running. Pausing stops simulated-time advancement. Reset rebuilds the last configured initial topology at simulated time zero.
+- `backend.app` exposes the engine through `GET /topology`, `GET /metrics`, `GET /events`, simulation start/pause/reset controls, normal/emergency traffic injection, and node/link failure and recovery controls. `POST/PATCH/DELETE /nodes` and `/links` are thin topology-editor adapters; `POST /disasters/trigger` delegates failure selection and mutation to the engine.
+- The API manager owns one `Simulator`, protects it with an asynchronous lock, and advances it by one engine tick at each configured real-time interval while running. Pausing stops simulated-time advancement. Reset rebuilds the most recently edited topology at simulated time zero, clears packets and measurements, and returns components to operational health.
 - `POST /simulation/start` without a body resumes the current run. Supplying a validated start body creates a fresh run with optional topology, tick interval, queue size, default packet size, lifetime, and congestion weight. If topology is omitted, the last configured topology is retained.
 - `GET /topology` includes component health, link queues, active routes, packet state, active failures, and routing-change events. `/metrics` and `/events` expose measured engine output without recalculating or fabricating it in the API.
 - Request and response schemas are defined with Pydantic in `backend/models.py` and appear in the generated OpenAPI document and interactive `/docs` page.
+- Development and production-preview origins are enabled by default. Deployments can override the comma-separated allowlist with `FRONTEND_ORIGINS`.
+
+## React frontend
+
+- `frontend/` is a strict TypeScript React application built with Vite. React Flow is an interactive topology editor with a router/switch/emergency-service palette, draggable persisted positions, link creation, a click-driven inspector, and visible operational/failed components. Active routes, link queues, and normal/emergency packet markers come from backend snapshots.
+- Start, pause, reset, traffic generation, topology edits, manual health controls, and disaster triggers call FastAPI directly. The browser does not maintain a second topology, advance time, choose routes, select disaster failures, move packets, or calculate metrics. React holds only transient canvas interaction state while dragging; drag completion persists the position before polling resumes authority.
+- The dashboard polls `/topology`, `/metrics`, and `/events` every 800 milliseconds. Metrics, failure state, active routes, packets, and friendly event-log messages are projections of backend responses.
+- The API base defaults to `http://127.0.0.1:8000` and can be changed at build time with `VITE_API_BASE_URL`.
+- The interface is intended for a desktop demonstration and includes a topology legend, measured metric cards, per-link utilization bars, connection/run state, and a reverse-chronological event stream.
 
 ## Models and public controls
 
-- `Node`: string `id`, display `name`, and `status` (`operational` or `failed`). String-only node configuration uses the ID as its name.
+- `Node`: string `id`, display `name`, `status` (`operational` or `failed`), component `type`, and optional editor coordinates `x`/`y`. Supported types are router, switch, hospital, police, fire, rescue, and ambulance. All are generic graph vertices; the type describes their role and disaster targeting, not a separate routing implementation. String-only node configuration uses the ID as its name and router as its type.
 - `Link`: `id`, `source`, `destination`, positive integer `bandwidth` in bytes/second, positive integer propagation `latency` in seconds, and component `status`. `current_load` is bytes transmitted during the most recently processed tick. `utilization` is the cumulative fraction of available byte capacity consumed.
 - `Packet`: generated integer `id`, source/destination IDs, `size` in bytes, `priority`/`packet_class` (`normal` or `emergency`), `creation_time`, nullable `delivery_time`, `route`, and `status` (`queued`, `in_flight`, `delivered`, or `dropped`). `route` is the latest planned route from a forwarding node; `path` is the actual sequence of visited nodes. Position, selected link queue, remaining serialization bytes, deadline, drop reason, and measured delivery latency are also exposed.
-- `Network`: `nodes`, `links`, and `adjacency` dictionaries; `add_node`, `add_link`, `fail_node`, `recover_node`, `fail_link`, `recover_link`, and `route` methods. Links are undirected; self-loops and parallel links are rejected. An empty network can be populated incrementally. `from_dict` accepts node IDs or node objects and link configuration dictionaries.
+- `Network`: `nodes`, `links`, and `adjacency` dictionaries; validated add/update/remove, fail/recover, and `route` methods. Links are undirected; self-loops and parallel links are rejected. An empty network can be populated incrementally. Deleting a node removes its incident links. Active packets affected by deletion are dropped with recorded reasons; other queued packets recalculate routes.
 - `Simulator`: owns an independent copy of its input network. Use `sim.network` methods to alter an active simulation; these notify the engine so queues, failures, and events stay consistent. Direct mutation of model fields or graph dictionaries is unsupported. Nodes and links may be added between steps.
 - `inject` generates a packet with optional size, class, and emergency service category. `normal` is the normal class. `emergency`, `hospital`, `ambulance`, `police`, `fire`, and `rescue` select the emergency class. `generate_packet` provides a simple size/priority interface. `step`, `metrics`, and `snapshot` advance and inspect the simulation. Snapshots are detached, JSON-serializable data.
 
@@ -44,6 +53,17 @@ Steps 1 through 3 are implemented. No frontend is implemented.
 - Packet lifetime is checked at tick boundaries before delivery. Arrival exactly at the deadline expires. Source-equals-destination delivers immediately if operational, without link usage.
 - Configuration and control inputs are validated before mutation. Deterministic tie-breaking and event ordering make runs reproducible.
 
+## Disaster presets
+
+Disasters are understandable infrastructure-failure presets, not physical or scientific hazard models. Selection occurs in `Simulator.trigger_disaster`; every selected component is failed through the same `Network` health methods used by manual controls, so existing packet, routing, event, and metric behavior remains authoritative. Low, medium, and high intensity use increasing fractions of currently operational candidates. A seed makes demonstrations reproducible.
+
+- Earthquake selects both nodes and links when those categories are available.
+- Flood selects a small cluster nearest a seeded anchor using node positions and link midpoints; without coordinates it falls back to a deterministic mixed selection.
+- Cyclone selects primarily links and a smaller number of nodes.
+- Cyberattack selects primarily router and switch nodes, with a small secondary link effect.
+
+The engine emits `disaster_triggered`, ordinary component failure and route-change events, and `recalculating_routes`. Failed components remain in topology snapshots. Packets that still have alternate paths reroute; unreachable packets follow the normal drop path. Recovery remains manual and does not revive dropped packets.
+
 ## Measured metrics
 
 All metrics derive from packet events and actual byte transmission; none are synthetic placeholders.
@@ -57,10 +77,12 @@ All metrics derive from packet events and actual byte transmission; none are syn
 
 ## Validation and demonstration
 
-Run `.venv/bin/python -m unittest discover -s tests -v` for the full engine and API suite: model/graph controls, shortest paths, failure exclusions, rerouting, unreachable drops, recovery, real per-link emergency priority under heavy normal traffic, variable-size serialization, nonpreemption, shared bandwidth, queue overflow, per-class latency, exact throughput/utilization, conservation, deterministic execution, API lifecycle/background ticking, traffic injection, health controls, schemas, validation, and snapshot isolation.
+Run `.venv/bin/python -m unittest discover -s tests -v` for the full engine and API suite: model/graph controls, editor CRUD and reset persistence, disaster selection and real failure mutation, shortest paths, failure exclusions, rerouting, unreachable drops, recovery, real per-link emergency priority under heavy normal traffic, variable-size serialization, nonpreemption, shared bandwidth, queue overflow, per-class latency, exact throughput/utilization, conservation, deterministic execution, API lifecycle/background ticking, traffic injection, health controls, schemas, validation, and snapshot isolation.
+
+Run `npm install` and `npm run build` inside `frontend/` for dependency and strict TypeScript/production-bundle verification. `npm run dev` serves the development UI on port 5173; `npm run preview` serves the production bundle on port 4173.
 
 Run `python3 -m simulator` for a reproducible terminal demonstration of prioritized traffic, a failed primary link, backup routing, and restoration. It prints events, packet state, and measured metrics as JSON.
 
 ## Deliberate simplifications
 
-This is an educational simulator, not a real network emulator. It uses whole-second tick resolution, undirected shared-bandwidth links, and centralized instantaneous route computation. It does not model sockets, TCP retransmission, routing-protocol convergence, or fragmentation. The current API owns one in-memory simulation process and has no authentication or persistence; bounded demonstration runs are expected. Future service work should add sessions, authentication where appropriate, persistence, and history limits.
+This is an educational simulator, not a real network emulator. It uses whole-second tick resolution, undirected shared-bandwidth links, centralized instantaneous route computation, and disaster presets based on component categories/proximity rather than physical models. It does not model sockets, TCP retransmission, routing-protocol convergence, fragmentation, geographic hazard propagation, or real cyberattack mechanics. The current API owns one in-memory simulation process and has no authentication or disk persistence; bounded demonstration runs are expected. Future service work should add sessions, authentication where appropriate, persistence, and history limits.

@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field
 HealthStatus = Literal["operational", "failed"]
 SimulationStatus = Literal["running", "paused"]
 PacketStatus = Literal["queued", "in_flight", "delivered", "dropped"]
+NodeType = Literal["router", "switch", "hospital", "police", "fire", "rescue", "ambulance"]
+DisasterType = Literal["earthquake", "flood", "cyclone", "cyberattack"]
+DisasterIntensity = Literal["low", "medium", "high"]
 
 
 class NodeConfig(BaseModel):
@@ -16,6 +19,9 @@ class NodeConfig(BaseModel):
     id: str = Field(min_length=1)
     name: str | None = None
     status: HealthStatus = "operational"
+    type: NodeType = "router"
+    x: float | None = Field(default=None, allow_inf_nan=False)
+    y: float | None = Field(default=None, allow_inf_nan=False)
 
 
 class LinkConfig(BaseModel):
@@ -32,8 +38,32 @@ class LinkConfig(BaseModel):
 class TopologyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    nodes: list[NodeConfig] = Field(min_length=1)
+    nodes: list[NodeConfig] = Field(default_factory=list)
     links: list[LinkConfig] = Field(default_factory=list)
+
+
+class NodeUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1)
+    type: NodeType | None = None
+    x: float | None = Field(default=None, allow_inf_nan=False)
+    y: float | None = Field(default=None, allow_inf_nan=False)
+
+
+class LinkUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bandwidth: int | None = Field(default=None, gt=0)
+    latency: int | None = Field(default=None, gt=0)
+
+
+class DisasterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    disaster: DisasterType
+    intensity: DisasterIntensity = "medium"
+    seed: int = 0
 
 
 class SimulationStartRequest(BaseModel):
@@ -66,6 +96,9 @@ class NodeState(BaseModel):
     id: str
     name: str
     status: HealthStatus
+    type: NodeType
+    x: float | None
+    y: float | None
 
 
 class LinkState(BaseModel):
@@ -139,6 +172,14 @@ class TopologyResponse(BaseModel):
     packets: list[PacketState]
     failures: list[FailureState]
     routing_changes: list[SimulationEvent]
+
+
+class DisasterResponse(BaseModel):
+    disaster: DisasterType
+    intensity: DisasterIntensity
+    failed_nodes: list[str]
+    failed_links: list[str]
+    topology: TopologyResponse
 
 
 class ControlResponse(BaseModel):

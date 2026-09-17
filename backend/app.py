@@ -3,19 +3,28 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
+import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 
 from simulator import Link, Network, Node, Simulator
 
 from .models import (
     ControlResponse,
+    DisasterRequest,
+    DisasterResponse,
     EmergencyTrafficRequest,
     ErrorResponse,
     EventsResponse,
+    LinkConfig,
+    LinkUpdateRequest,
     MetricsResponse,
+    NodeConfig,
+    NodeUpdateRequest,
     SimulationStartRequest,
+    TopologyConfig,
     TopologyResponse,
     TrafficRequest,
     TrafficResponse,
@@ -25,10 +34,10 @@ from .models import (
 DEFAULT_START = SimulationStartRequest.model_validate({
     "topology": {
         "nodes": [
-            {"id": "hospital", "name": "Hospital"},
-            {"id": "router", "name": "Primary Router"},
-            {"id": "backup", "name": "Backup Router"},
-            {"id": "rescue", "name": "Rescue Center"},
+            {"id": "hospital", "name": "Hospital", "type": "hospital", "x": 70, "y": 170},
+            {"id": "router", "name": "Primary Router", "x": 300, "y": 40},
+            {"id": "backup", "name": "Backup Router", "x": 300, "y": 300},
+            {"id": "rescue", "name": "Rescue Center", "type": "rescue", "x": 530, "y": 170},
         ],
         "links": [
             {"id": "hospital-router", "source": "hospital", "destination": "router"},
@@ -40,12 +49,27 @@ DEFAULT_START = SimulationStartRequest.model_validate({
     },
 })
 
+DEFAULT_FRONTEND_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+)
+
+
+def _frontend_origins() -> list[str]:
+    configured = os.getenv("FRONTEND_ORIGINS")
+    if configured is None:
+        return list(DEFAULT_FRONTEND_ORIGINS)
+    return [origin.strip() for origin in configured.split(",") if origin.strip()]
+
 
 def _build_simulator(config: SimulationStartRequest) -> Simulator:
     topology = config.topology
     if topology is None:
         raise ValueError("a topology is required to create a simulation")
-    nodes = [Node(node.id, node.name or node.id, node.status) for node in topology.nodes]
+    nodes = [Node(node.id, node.name or node.id, node.status, node.type, node.x, node.y)
+             for node in topology.nodes]
     links = [Link(link.id, link.source, link.destination, link.bandwidth,
                   link.latency, link.status) for link in topology.links]
     return Simulator(
@@ -182,6 +206,20 @@ class SimulationManager:
         snapshot_packets = {packet["id"]: packet for packet in self.simulator.snapshot()["packets"]}
         return [snapshot_packets[packet.id] for packet in packets]
 
+    def sync_topology_config(self) -> None:
+        """Keep editor topology for reset while treating failures as run-time state."""
+        network = self.simulator.network
+        self._config.topology = TopologyConfig(
+            nodes=[NodeConfig(
+                id=node.id, name=node.name, status="operational", type=node.type,
+                x=node.x, y=node.y,
+            ) for node in network.nodes.values()],
+            links=[LinkConfig(
+                id=link.id, source=link.source, destination=link.destination,
+                bandwidth=link.bandwidth, latency=link.latency, status="operational",
+            ) for link in network.links.values()],
+        )
+
 
 def _manager(request: Request) -> SimulationManager:
     return request.app.state.manager
@@ -205,6 +243,12 @@ def create_app(default_config: SimulationStartRequest | None = None) -> FastAPI:
         title="Disaster Network Simulator API",
         version="1.0.0",
         lifespan=lifespan,
+    )
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=_frontend_origins(),
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type"],
     )
     application.state.manager = manager
 
@@ -280,6 +324,56 @@ def create_app(default_config: SimulationStartRequest | None = None) -> FastAPI:
     async def recover_node(id: str, request: Request) -> dict:
         return await set_component_health(request, "node", id, False)
 
+    @application.post("/nodes", response_model=TopologyResponse, status_code=201,
+                      responses={400: {"model": ErrorResponse}})
+    async def create_node(node: NodeConfig, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                simulation.simulator.network.add_node(Node(
+                    node.id, node.name or node.id, node.status, node.type, node.x, node.y,
+                ))
+                simulation.sync_topology_config()
+                return simulation.topology()
+            except ValueError as exc:
+                raise _http_error(exc) from exc
+
+    @application.patch("/nodes/{id}", response_model=TopologyResponse,
+                       responses={400: {"model": ErrorResponse},
+                                  404: {"model": ErrorResponse}})
+    async def update_node(id: str, update: NodeUpdateRequest, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                network = simulation.simulator.network
+                if id not in network.nodes:
+                    raise ValueError("unknown node ID")
+                current = network.nodes[id]
+                fields = update.model_fields_set
+                network.update_node(
+                    id,
+                    name=update.name if "name" in fields and update.name is not None else current.name,
+                    type=update.type if "type" in fields and update.type is not None else current.type,
+                    x=update.x if "x" in fields else current.x,
+                    y=update.y if "y" in fields else current.y,
+                )
+                simulation.sync_topology_config()
+                return simulation.topology()
+            except ValueError as exc:
+                raise _http_error(exc) from exc
+
+    @application.delete("/nodes/{id}", response_model=TopologyResponse,
+                        responses={404: {"model": ErrorResponse}})
+    async def delete_node(id: str, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                simulation.simulator.network.remove_node(id)
+                simulation.sync_topology_config()
+                return simulation.topology()
+            except ValueError as exc:
+                raise _http_error(exc) from exc
+
     @application.post("/links/{id}/fail", response_model=TopologyResponse,
                       responses={404: {"model": ErrorResponse}})
     async def fail_link(id: str, request: Request) -> dict:
@@ -289,6 +383,68 @@ def create_app(default_config: SimulationStartRequest | None = None) -> FastAPI:
                       responses={404: {"model": ErrorResponse}})
     async def recover_link(id: str, request: Request) -> dict:
         return await set_component_health(request, "link", id, False)
+
+    @application.post("/links", response_model=TopologyResponse, status_code=201,
+                      responses={400: {"model": ErrorResponse}})
+    async def create_link(link: LinkConfig, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                simulation.simulator.network.add_link(Link(
+                    link.id, link.source, link.destination, link.bandwidth,
+                    link.latency, link.status,
+                ))
+                simulation.sync_topology_config()
+                return simulation.topology()
+            except ValueError as exc:
+                raise _http_error(exc) from exc
+
+    @application.patch("/links/{id}", response_model=TopologyResponse,
+                       responses={400: {"model": ErrorResponse},
+                                  404: {"model": ErrorResponse}})
+    async def update_link(id: str, update: LinkUpdateRequest, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                network = simulation.simulator.network
+                if id not in network.links:
+                    raise ValueError("unknown link ID")
+                current = network.links[id]
+                network.update_link(
+                    id,
+                    bandwidth=(update.bandwidth if update.bandwidth is not None
+                               else current.bandwidth),
+                    latency=update.latency if update.latency is not None else current.latency,
+                )
+                simulation.sync_topology_config()
+                return simulation.topology()
+            except ValueError as exc:
+                raise _http_error(exc) from exc
+
+    @application.delete("/links/{id}", response_model=TopologyResponse,
+                        responses={404: {"model": ErrorResponse}})
+    async def delete_link(id: str, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                simulation.simulator.network.remove_link(id)
+                simulation.sync_topology_config()
+                return simulation.topology()
+            except ValueError as exc:
+                raise _http_error(exc) from exc
+
+    @application.post("/disasters/trigger", response_model=DisasterResponse,
+                      responses={400: {"model": ErrorResponse}})
+    async def trigger_disaster(disaster: DisasterRequest, request: Request) -> dict:
+        simulation = _manager(request)
+        async with simulation._lock:
+            try:
+                result = simulation.simulator.trigger_disaster(
+                    disaster.disaster, disaster.intensity, seed=disaster.seed,
+                )
+                return {**result, "topology": simulation.topology()}
+            except ValueError as exc:
+                raise _http_error(exc) from exc
 
     @application.get("/metrics", response_model=MetricsResponse)
     async def get_metrics(request: Request) -> dict:
