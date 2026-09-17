@@ -2,15 +2,23 @@
 
 ## Architecture and implementation plan
 
-The core is a deterministic Python engine with no third-party runtime dependencies. `simulator/engine.py` contains the models, adjacency-map graph, heap-based Dijkstra routing, queues, transmissions, measurements, and structured events. Networking logic is independent of web frameworks and visualization. Unit tests use Python unittest.
+The core is a deterministic Python engine with no third-party runtime dependencies. `simulator/engine.py` contains the models, adjacency-map graph, heap-based Dijkstra routing, queues, transmissions, measurements, and structured events. Networking logic is independent of web frameworks and visualization. `backend/` is a thin FastAPI adapter that calls the engine's public controls and returns its snapshots, metrics, and events. Tests use Python unittest.
 
 Implementation order:
 1. Core models, configurable graph, Dijkstra, packet generation, transmission, and delivery — implemented.
 2. Failure/recovery, congestion-aware routing, emergency scheduling, measured metrics, and core tests — implemented.
-3. Later: FastAPI topology, packet injection, stepping, failure/recovery, and snapshot endpoints. One engine per simulation, serialized mutations.
+3. FastAPI topology, lifecycle, traffic injection, failure/recovery, metrics, and event endpoints — implemented. One engine instance is owned by the API manager and mutations are serialized.
 4. Later: React graph visualization using snapshots/events, controls, and metric charts.
 
-Only steps 1 and 2 are currently authorized. No API or frontend is implemented.
+Steps 1 through 3 are implemented. No frontend is implemented.
+
+## FastAPI backend
+
+- `backend.app` exposes the engine through `GET /topology`, `GET /metrics`, `GET /events`, simulation start/pause/reset controls, normal/emergency traffic injection, and node/link failure and recovery controls.
+- The API manager owns one `Simulator`, protects it with an asynchronous lock, and advances it by one engine tick at each configured real-time interval while running. Pausing stops simulated-time advancement. Reset rebuilds the last configured initial topology at simulated time zero.
+- `POST /simulation/start` without a body resumes the current run. Supplying a validated start body creates a fresh run with optional topology, tick interval, queue size, default packet size, lifetime, and congestion weight. If topology is omitted, the last configured topology is retained.
+- `GET /topology` includes component health, link queues, active routes, packet state, active failures, and routing-change events. `/metrics` and `/events` expose measured engine output without recalculating or fabricating it in the API.
+- Request and response schemas are defined with Pydantic in `backend/models.py` and appear in the generated OpenAPI document and interactive `/docs` page.
 
 ## Models and public controls
 
@@ -49,10 +57,10 @@ All metrics derive from packet events and actual byte transmission; none are syn
 
 ## Validation and demonstration
 
-Run `python3 -m unittest discover -s tests -v` for model/graph controls, shortest paths, failure exclusions, rerouting, unreachable drops, recovery, real per-link emergency priority under heavy normal traffic, variable-size serialization, nonpreemption, shared bandwidth, queue overflow, per-class latency, exact throughput/utilization, conservation, deterministic execution, input validation, and snapshot isolation.
+Run `.venv/bin/python -m unittest discover -s tests -v` for the full engine and API suite: model/graph controls, shortest paths, failure exclusions, rerouting, unreachable drops, recovery, real per-link emergency priority under heavy normal traffic, variable-size serialization, nonpreemption, shared bandwidth, queue overflow, per-class latency, exact throughput/utilization, conservation, deterministic execution, API lifecycle/background ticking, traffic injection, health controls, schemas, validation, and snapshot isolation.
 
 Run `python3 -m simulator` for a reproducible terminal demonstration of prioritized traffic, a failed primary link, backup routing, and restoration. It prints events, packet state, and measured metrics as JSON.
 
 ## Deliberate simplifications
 
-This is an educational simulator, not a real network emulator. It uses whole-second tick resolution, undirected shared-bandwidth links, and centralized instantaneous route computation. It does not model sockets, TCP retransmission, routing-protocol convergence, or fragmentation. Histories remain in memory; bounded demonstration runs are expected. Future service work should add session and history limits.
+This is an educational simulator, not a real network emulator. It uses whole-second tick resolution, undirected shared-bandwidth links, and centralized instantaneous route computation. It does not model sockets, TCP retransmission, routing-protocol convergence, or fragmentation. The current API owns one in-memory simulation process and has no authentication or persistence; bounded demonstration runs are expected. Future service work should add sessions, authentication where appropriate, persistence, and history limits.
